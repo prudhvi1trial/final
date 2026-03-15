@@ -4,6 +4,7 @@ import time
 import math
 import random
 import os
+import colorsys
 from PIL import Image  # type: ignore
 from pose_detector import PoseDetector
 from holistic_detector import HolisticDetector
@@ -95,10 +96,18 @@ class App(ctk.CTk):
 
         ctk.CTkLabel(self.tabview.tab("Appearance"), text="Rendering Style:", anchor="w").grid(row=8, column=0, padx=20, pady=(5, 0), sticky="w")
         
-        # Combine Sanjay's styles and Viven's filters
+        # Define the requested top 5 styles
+        top_styles = ["Classic Stickman", "Aura", "Magic Button", "Shadow Void", "Bubbles"]
+        
+        # Original sets of styles
         sanjay_styles = ["Bubble Man", "Hell Fire", "Shadow Void", "Magic Button", "Classic Stickman", "Minimalist Line Art", "Anatomical Skeleton", "Ultimate 3D Wireframe"]
         viven_styles = [name for name in VIVEN_FILTER_REGISTRY.keys() if name != "Default"]
-        all_styles = sanjay_styles + viven_styles
+        
+        # Combine and ensure no duplicates, maintaining requested order first
+        remaining_sanjay = [s for s in sanjay_styles if s not in top_styles]
+        remaining_viven = [s for s in viven_styles if s not in top_styles]
+        
+        all_styles = top_styles + remaining_sanjay + remaining_viven
         
         self.style_menu = ctk.CTkOptionMenu(self.tabview.tab("Appearance"), values=all_styles)
         self.style_menu.set("Classic Stickman")
@@ -161,27 +170,29 @@ class App(ctk.CTk):
         self.sparkle_image_raw = cv2.imread(self.sparkle_image_path, cv2.IMREAD_UNCHANGED) if os.path.exists(self.sparkle_image_path) else None
         
         self.magic_button_active = False
-        self.button_rect = (0, 0, 0, 0) # Placeholder
-        self.button_pos = None # (x, y) coordinates of button center
+        self.button_rect = (0, 0, 0, 0)
+        self.button_pos = None 
+        self.button_vel = [0.0, 0.0]
         self.magic_touch_count = 0 
-        self.magic_bg_color = (180, 105, 255) # Initial Hot Pink
+        self.magic_bg_color = (180, 105, 255)
         self.magic_stickman_theme = {"outline": (255, 200, 0), "inner": (255, 255, 100), "joint": (255, 150, 0)}
         self.magic_cooldown = 0
-        self.frame_count = 0 # For frame-skipping logic
+        self.frame_count = 0
         self.holistic_face_results = None
         self.holistic_hand_results = None
         
         # --- Gesture Control State ---
-        self.gesture_history = []  # List of (x, y) for right wrist
-        self.gesture_cooldown = 0   # Frames until next gesture allowed
-        self.swipe_threshold = 100 # Minimum horizontal movement
-        self.history_len = 15      # Frames to track for gesture
+        self.gesture_history = []
+        self.gesture_cooldown = 0
+        self.swipe_threshold = 100
+        self.history_len = 15
         
         # --- Auto-Styling State ---
         self.last_style_change_time = 0.0
         
-        # --- Minimalist Line Art State ---
+        # --- Minimalist Line Art / Magic Button Trail State ---
         self.miniline_canvas = None  # Persistent trail canvas
+        self.magic_trail_canvas = None # Persistent trail canvas for Magic Button
         # Background subtractor to separate person from bg
         self.bg_subtractor = cv2.createBackgroundSubtractorMOG2(history=100, varThreshold=40, detectShadows=False)
 
@@ -540,30 +551,81 @@ class App(ctk.CTk):
             # --- Magic Button Interaction ---
             if style == "Magic Button":
                 btn_sz = 100
+                margin = btn_sz // 2
+                
                 # Initialize button position if not set
                 if self.button_pos is None:
                     # Default to Top-Right
-                    self.button_pos = (w - btn_sz//2 - 30, 30 + btn_sz//2)
+                    self.button_pos = (w - margin - 30, 30 + margin)
                 
+                # --- Physics & Movement ---
                 bx, by = self.button_pos
-                x1, y1 = bx - btn_sz//2, by - btn_sz//2
-                x2, y2 = bx + btn_sz//2, by + btn_sz//2
-                self.button_rect = (x1, y1, x2, y2)
+                vx, vy = self.button_vel
                 
-                # Draw Button Region
-                cv2.circle(art_img, (x1 + btn_sz//2, y1 + btn_sz//2), btn_sz//2 + 5, (0, 0, 200), -1) # Vivid Red Circle
-                cv2.circle(art_img, (x1 + btn_sz//2, y1 + btn_sz//2), btn_sz//2 + 5, (255, 255, 255), 2) # White stroke
+                # Apply velocity
+                bx += vx
+                by += vy
+                
+                # Apply Friction
+                vx *= 0.95
+                vy *= 0.95
+                self.button_vel = [vx, vy]
+                
+                # Wall Collisions: Bounce off edges
+                if bx < margin:
+                    bx = margin
+                    self.button_vel[0] *= -0.8
+                elif bx > w - margin:
+                    bx = w - margin
+                    self.button_vel[0] *= -0.8
+                    
+                if by < margin:
+                    by = margin
+                    self.button_vel[1] *= -0.8
+                elif by > h - margin:
+                    by = h - margin
+                    self.button_vel[1] *= -0.8
+                
+                self.button_pos = (bx, by)
+                
+                x1, y1 = int(bx - margin), int(by - margin)
+                x2, y2 = int(bx + margin), int(by + margin)
+                self.button_rect = (x1, y1, x2, y2)
+
+                # --- Trail Effect ---
+                if self.magic_trail_canvas is None or self.magic_trail_canvas.shape[:2] != (h, w):
+                    self.magic_trail_canvas = np.zeros((h, w, 3), dtype=np.uint8)
+                
+                # Fade the trail
+                self.magic_trail_canvas = cv2.addWeighted(self.magic_trail_canvas, 0.92, np.zeros((h, w, 3), dtype=np.uint8), 0.08, 0)
+                
+                # Draw new trail point if moving
+                if abs(vx) > 0.5 or abs(vy) > 0.5:
+                    cv2.circle(self.magic_trail_canvas, (int(bx), int(by)), btn_sz // 3, (0, 0, 180), -1) # Faded red
+                
+                # Overlay trail onto Art Canvas
+                art_img = cv2.addWeighted(art_img, 1.0, self.magic_trail_canvas, 0.5, 0)
+
+                # --- Draw Button ---
+                cv2.circle(art_img, (int(bx), int(by)), margin + 5, (0, 0, 200), -1) 
+                cv2.circle(art_img, (int(bx), int(by)), margin + 5, (255, 255, 255), 2)
                 
                 # Overlay Button Image if loaded
                 if self.btn_image_raw is not None:
                     btn_resized = cv2.resize(self.btn_image_raw, (btn_sz, btn_sz))
-                    if btn_resized.shape[2] == 4:
-                        for c in range(0, 3):
-                            alpha_channel = btn_resized[:,:,3]/255.0
-                            art_img[y1:y2, x1:x2, c] = btn_resized[:,:,c] * alpha_channel + \
-                                                      art_img[y1:y2, x1:x2, c] * (1.0 - alpha_channel)
-                    else:
-                        art_img[y1:y2, x1:x2] = btn_resized
+                    r_y1, r_y2 = max(0, y1), min(h, y2)
+                    r_x1, r_x2 = max(0, x1), min(w, x2)
+                    if r_y2 > r_y1 and r_x2 > r_x1:
+                        im_y1, im_y2 = r_y1 - y1, r_y1 - y1 + (r_y2 - r_y1)
+                        im_x1, im_x2 = r_x1 - x1, r_x1 - x1 + (r_x2 - r_x1)
+                        btn_crop = btn_resized[im_y1:im_y2, im_x1:im_x2]
+                        if btn_crop.shape[2] == 4:
+                            for c in range(0, 3):
+                                alpha_channel = btn_crop[:,:,3]/255.0
+                                art_img[r_y1:r_y2, r_x1:r_x2, c] = btn_crop[:,:,c] * alpha_channel + \
+                                                                  art_img[r_y1:r_y2, r_x1:r_x2, c] * (1.0 - alpha_channel)
+                        else:
+                            art_img[r_y1:r_y2, r_x1:r_x2] = btn_crop
 
                 # Check Collision (Wrist 15, 16)
                 if self.magic_cooldown > 0:
@@ -572,20 +634,20 @@ class App(ctk.CTk):
                     for id in [15, 16]:
                         if id in points:
                             px, py = points[id]
-                            if x1 < px < x2 and y1 < py < y2:
+                            # Simple distance check for physics interaction
+                            if math.hypot(px - bx, py - by) < margin + 10:
                                 self.magic_button_active = not self.magic_button_active
                                 self.magic_touch_count += 1
                                 status = f"Touch #{self.magic_touch_count}!"
                                 color = "pink" if self.magic_button_active else "gray"
                                 self.status_label.configure(text=status, text_color=color)
-                                self.magic_cooldown = 30 # 1.5 second cooldown
+                                self.magic_cooldown = 15 # Physics cooldown
                                 
-                                # Move button to a random place
-                                margin = btn_sz + 50
-                                self.button_pos = (
-                                    random.randint(margin, w - margin),
-                                    random.randint(margin, h - margin)
-                                )
+                                # Physics: Set velocity to push away from hand
+                                dx, dy = bx - px, by - py
+                                dist = math.hypot(dx, dy) or 1
+                                push_speed = 25.0
+                                self.button_vel = [(dx/dist) * push_speed, (dy/dist) * push_speed]
                                 
                                 # Randomize Colors
                                 self.magic_bg_color = (random.randint(50, 255), random.randint(50, 255), random.randint(50, 255))
@@ -598,19 +660,12 @@ class App(ctk.CTk):
                 
                 # Draw Counter at Top Center
                 counter_text = f"TOUCHES: {self.magic_touch_count}"
-                font = cv2.FONT_HERSHEY_DUPLEX
-                f_scale = 1.2
-                f_thick = 2
+                font, f_scale, f_thick = cv2.FONT_HERSHEY_DUPLEX, 1.2, 2
                 (tw, th), baseline = cv2.getTextSize(counter_text, font, f_scale, f_thick)
-                tx = (w - tw) // 2
-                ty = 60
-                
-                # Shadow/Glow effect
+                tx, ty = (w - tw) // 2, 60
                 cv2.putText(art_img, counter_text, (tx+2, ty+2), font, f_scale, (20, 20, 20), f_thick + 2)
-                # Main text
                 c_color = (255, 180, 255) if self.magic_button_active else (200, 200, 200)
                 cv2.putText(art_img, counter_text, (tx, ty), font, f_scale, c_color, f_thick)
-                # Underline
                 cv2.line(art_img, (tx, ty + 10), (tx + tw, ty + 10), c_color, 2)
                     
             # Draw Joints (not for Minimalist Line Art)

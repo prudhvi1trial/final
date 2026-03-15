@@ -101,3 +101,5 @@ def apply(canvas: np.ndarray, pose, **kwargs) -> np.ndarray:
             cv2.addWeighted(canvas, 1.0, cv2.resize(lb, (w, h)), strength, 0, dst=canvas)
 
     return canvas
+
+    return canvas
