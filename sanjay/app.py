@@ -1,3 +1,4 @@
+from __future__ import annotations
 import customtkinter as ctk  # type: ignore
 import cv2  # type: ignore
 import time
@@ -210,11 +211,31 @@ class App(ctk.CTk):
         else:
             self.camera_running = True
             self.btn_toggle_cam.configure(text="Stop Camera", fg_color=["#3B8ED0", "#1F6AA5"], hover_color=["#36719F", "#144870"])
-            self.status_label.configure(text="Status: Running")
-            self.cap = cv2.VideoCapture(0)
-            self.update_video()
+            self.status_label.configure(text="Status: Connecting...")
+            
+            try:
+                self.cap = cv2.VideoCapture(0)
+                if not self.cap.isOpened():
+                    raise RuntimeError("Could not open webcam.")
+                self.status_label.configure(text="Status: Running")
+                self.update_video()
+            except Exception as e:
+                self.camera_running = False
+                self.btn_toggle_cam.configure(text="Start Camera")
+                self.status_label.configure(text=f"Error: {str(e)}")
+                print(f"Startup error: {e}")
 
     def draw_stickman(self, img, lm_list):
+        """
+        Main artistic rendering pipeline. Converts pose landmarks into various artistic styles.
+        
+        Args:
+            img: The current video frame (BGR).
+            lm_list: List of detected landmarks [[id, x, y], ...].
+            
+        Returns:
+            The rendered artistic image.
+        """
         h, w, c = img.shape
         
         # Canvas Mode Handling
@@ -236,6 +257,7 @@ class App(ctk.CTk):
                 # Apply Viven Filter
                 try:
                     start_f = time.time()
+                    # Ensure results is assigned even if apply fails
                     result = VIVEN_FILTER_REGISTRY[style].apply(art_img, pose_viven, original_frame=img)
                     duration = (time.time() - start_f) * 1000
                     if duration > 100: # Log only if significantly slow
@@ -268,7 +290,7 @@ class App(ctk.CTk):
             art_img = cv2.convertScaleAbs(img, alpha=0.3, beta=0) 
         
         if len(lm_list) != 0:
-            connections = [
+            connections: list[tuple[int, int]] = [
                 (11, 12), # shoulders
                 (11, 13), (13, 15), # left arm
                 (12, 14), (14, 16), # right arm
@@ -277,8 +299,9 @@ class App(ctk.CTk):
                 (24, 26), (26, 28), # right leg
             ]
             
-            
-            points = {lm[0]: (lm[1], lm[2]) for lm in lm_list}
+            # Using unique name to avoid linter confusion and adding explicit types
+            lm_map: dict[int, tuple[int, int]] = {int(lm[0]): (int(lm[1]), int(lm[2])) for lm in lm_list}
+            points = lm_map # Alias for compatibility with existing render logic
             
             # Get current dynamic settings
             style = self.style_menu.get()
@@ -851,10 +874,15 @@ class App(ctk.CTk):
 
     def on_closing(self):
         self.camera_running = False
-        if self.cap.isOpened():
-            self.cap.release()
-        if self.viven_detector:
-            self.viven_detector.close()
+        try:
+            if hasattr(self, 'cap') and self.cap.isOpened():
+                self.cap.release()
+            if hasattr(self, 'viven_detector') and self.viven_detector:
+                self.viven_detector.close()
+            if hasattr(self, 'holistic_detector') and self.holistic_detector:
+                self.holistic_detector.close()
+        except:
+            pass
         self.destroy()
 
 if __name__ == "__main__":

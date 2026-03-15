@@ -61,7 +61,11 @@ def apply(canvas: np.ndarray, pose, **kwargs) -> np.ndarray:
 
     # == 2. Body Aura (Segmentation) ==
     if pose.detected and pose.segmentation_mask is not None:
-        mask = pose.segmentation_mask.astype(np.float32)
+        mask = pose.segmentation_mask
+        if not isinstance(mask, np.ndarray):
+            mask = np.array(mask)
+        
+        mask = mask.astype(np.float32)
         if _prev_mask is None or _prev_mask.shape != mask.shape:
             _prev_mask = mask
         else:
