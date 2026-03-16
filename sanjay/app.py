@@ -7,6 +7,18 @@ import random
 import os
 import colorsys
 from PIL import Image  # type: ignore
+try:
+    import pygame
+    pygame.mixer.init()
+    _PYGAME_AVAILABLE = True
+except Exception:
+    _PYGAME_AVAILABLE = False
+
+try:
+    from pydub import AudioSegment  # type: ignore
+    _PYDUB_AVAILABLE = True
+except Exception:
+    _PYDUB_AVAILABLE = False
 from pose_detector import PoseDetector
 from holistic_detector import HolisticDetector
 # Import Viven Logic
@@ -110,7 +122,7 @@ class App(ctk.CTk):
         
         all_styles = top_styles + remaining_sanjay + remaining_viven
         
-        self.style_menu = ctk.CTkOptionMenu(self.tabview.tab("Appearance"), values=all_styles)
+        self.style_menu = ctk.CTkOptionMenu(self.tabview.tab("Appearance"), values=all_styles, command=lambda s: self._update_music(s))
         self.style_menu.set("Classic Stickman")
         self.style_menu.grid(row=9, column=0, padx=20, pady=(5, 15), sticky="ew")
 
@@ -123,21 +135,20 @@ class App(ctk.CTk):
         self.video_frame = ctk.CTkFrame(self)
         self.video_frame.grid(row=0, column=1, padx=20, pady=20, sticky="nsew")
         
-        # Configure layout inside video_frame
-        self.video_frame.grid_columnconfigure(0, weight=1)
-        self.video_frame.grid_columnconfigure(1, weight=1)
-        self.video_frame.grid_rowconfigure(1, weight=1)
+        # Configure layout inside video_frame for absolute overlapping positioning
+        # We will use .place() instead of grid() for PiP effect
 
         # Titles for the feeds
-        ctk.CTkLabel(self.video_frame, text="Live Camera Feed", font=ctk.CTkFont(size=16, weight="bold")).grid(row=0, column=0, pady=(10, 0))
-        ctk.CTkLabel(self.video_frame, text="Pose Art Canvas", font=ctk.CTkFont(size=16, weight="bold")).grid(row=0, column=1, pady=(10, 0))
+        ctk.CTkLabel(self.video_frame, text="Pose Art Canvas", font=ctk.CTkFont(size=16, weight="bold")).place(relx=0.5, y=5, anchor="n")
 
         # Image placeholders
-        self.lbl_video = ctk.CTkLabel(self.video_frame, text="")
-        self.lbl_video.grid(row=1, column=0, padx=10, pady=10, sticky="nsew")
-        
+        # Art goes on bottom, full size
         self.lbl_art = ctk.CTkLabel(self.video_frame, text="")
-        self.lbl_art.grid(row=1, column=1, padx=10, pady=10, sticky="nsew")
+        self.lbl_art.place(relx=0, rely=0, relwidth=1, relheight=1)
+        
+        # Video goes on top, top left corner
+        self.lbl_video = ctk.CTkLabel(self.video_frame, text="")
+        self.lbl_video.place(x=10, y=35)
 
         # Blank placeholder image for clearing panels cleanly
         self._blank_img = ctk.CTkImage(light_image=Image.new("RGB", (1, 1), (0, 0, 0)), size=(1, 1))
@@ -196,6 +207,32 @@ class App(ctk.CTk):
         self.magic_trail_canvas = None # Persistent trail canvas for Magic Button
         # Background subtractor to separate person from bg
         self.bg_subtractor = cv2.createBackgroundSubtractorMOG2(history=100, varThreshold=40, detectShadows=False)
+
+        # Physics tracking
+        self.prev_lm_list: list = []
+
+        # --- Background Music Mapping ---
+        # Map filter display names to audio file paths (relative to assets folder)
+        self._filter_songs: dict[str, str] = {
+            "Aura": os.path.join(base_path, "assets", "aurasong.mp3"),
+            # Add more mappings here e.g.:
+            # "Hell Fire": os.path.join(base_path, "assets", "hellfire.mp3"),
+        }
+        self._current_song: str | None = None  # Track currently playing song
+
+        # --- Soccer Hit Sound (for Magic Button bounces) ---
+        self.soccer_sound = None
+        if _PYGAME_AVAILABLE:
+            soccer_wav = os.path.join(base_path, "assets", "mixkit-hitting-soccer-ball-2112.wav")
+            if os.path.exists(soccer_wav):
+                try:
+                    self.soccer_sound = pygame.mixer.Sound(soccer_wav)
+                    self.soccer_sound.set_volume(1.0) # Set to full volume
+                except Exception as e:
+                    print(f"[Audio] Could not load soccer sound: {e}")
+
+        # Start music for the default style
+        self._update_music(self.style_menu.get())
 
         self.update_video()
 
@@ -595,20 +632,28 @@ class App(ctk.CTk):
                 self.button_vel = [vx, vy]
                 
                 # Wall Collisions: Bounce off edges
+                bounced = False
                 if bx < margin:
                     bx = margin
                     self.button_vel[0] *= -0.8
+                    bounced = True
                 elif bx > w - margin:
                     bx = w - margin
                     self.button_vel[0] *= -0.8
+                    bounced = True
                     
                 if by < margin:
                     by = margin
                     self.button_vel[1] *= -0.8
+                    bounced = True
                 elif by > h - margin:
                     by = h - margin
                     self.button_vel[1] *= -0.8
+                    bounced = True
                 
+                # Play hit sound on wall bounce
+                if bounced and self.soccer_sound:
+                    self.soccer_sound.play()
                 self.button_pos = (bx, by)
                 
                 x1, y1 = int(bx - margin), int(by - margin)
@@ -666,10 +711,24 @@ class App(ctk.CTk):
                                 self.status_label.configure(text=status, text_color=color)
                                 self.magic_cooldown = 15 # Physics cooldown
                                 
-                                # Physics: Set velocity to push away from hand
+                                # Play hit sound on hand touch
+                                if self.soccer_sound:
+                                    self.soccer_sound.play()
+                                
+                                # Physics: Set velocity base on hand speed
                                 dx, dy = bx - px, by - py
                                 dist = math.hypot(dx, dy) or 1
-                                push_speed = 25.0
+                                
+                                # Calculate hand speed if available
+                                hand_speed = 1.0
+                                if self.prev_lm_list:
+                                    for prev_lm in self.prev_lm_list:
+                                        if prev_lm[0] == id:
+                                            hand_speed = math.hypot(px - prev_lm[1], py - prev_lm[2])
+                                            break
+                                
+                                # Scale push speed by hand movement (min 25, max 70)
+                                push_speed = max(25.0, min(70.0, hand_speed * 2.5))
                                 self.button_vel = [(dx/dist) * push_speed, (dy/dist) * push_speed]
                                 
                                 # Randomize Colors
@@ -681,11 +740,12 @@ class App(ctk.CTk):
                                 self.after(2000, lambda: self.status_label.configure(text=status if self.magic_cooldown > 0 else "Ready", text_color="gray"))
                                 break
                 
-                # Draw Counter at Top Center
+                # Draw Counter at Top Center (shifted down so it's not hidden by PiP)
                 counter_text = f"TOUCHES: {self.magic_touch_count}"
                 font, f_scale, f_thick = cv2.FONT_HERSHEY_DUPLEX, 1.2, 2
                 (tw, th), baseline = cv2.getTextSize(counter_text, font, f_scale, f_thick)
-                tx, ty = (w - tw) // 2, 60
+                # Position it slightly below the top to avoid the PiP window covering it
+                tx, ty = (w - tw) // 2, 100 
                 cv2.putText(art_img, counter_text, (tx+2, ty+2), font, f_scale, (20, 20, 20), f_thick + 2)
                 c_color = (255, 180, 255) if self.magic_button_active else (200, 200, 200)
                 cv2.putText(art_img, counter_text, (tx, ty), font, f_scale, c_color, f_thick)
@@ -762,10 +822,65 @@ class App(ctk.CTk):
         self.particles = []
         self.miniline_canvas = None
         
+        # Update background music
+        self._update_music(new_style)
+        
         self.status_label.configure(text=f"Status: Style -> {new_style}", text_color="cyan")
         # Pulse the status label color back to gray after a delay
         self.after(2000, lambda: self.status_label.configure(text_color="gray"))
 
+
+    def _update_music(self, style: str) -> None:
+        """Play the background song for the given style, or stop if none mapped."""
+        if not _PYGAME_AVAILABLE:
+            return
+        song_path = self._filter_songs.get(style)
+        if song_path == self._current_song:
+            return  # Already playing the correct track
+        # Stop current music
+        try:
+            pygame.mixer.music.stop()
+        except Exception:
+            pass
+        self._current_song = song_path
+        if song_path and os.path.exists(song_path):
+            # --- 2x Speed Logic for Aura ---
+            if style == "Aura" and _PYDUB_AVAILABLE:
+                # Create a cached 2x speed version
+                path_2x = song_path.replace(".mp3", "_2x.mp3")
+                if not os.path.exists(path_2x):
+                    try:
+                        print(f"[Audio] Generating 2x speed version of {song_path}...")
+                        audio = AudioSegment.from_file(song_path)
+                        # Speed up without changing pitch (pydub speedup)
+                        # A better way is to change frame rate, but it alters pitch. 
+                        # We'll use the frame rate method as it's built-in and fast.
+                        new_sample_rate = int(audio.frame_rate * 2.0)
+                        audio_2x = audio._spawn(audio.raw_data, overrides={"frame_rate": new_sample_rate})
+                        audio_2x = audio_2x.set_frame_rate(audio.frame_rate)
+                        audio_2x.export(path_2x, format="mp3")
+                    except Exception as e:
+                        print(f"[Audio] Failed to generate 2x speed audio: {e}")
+                
+                # Use the 2x version if it exists
+                if os.path.exists(path_2x):
+                    song_path = path_2x
+
+            try:
+                pygame.mixer.music.load(song_path)
+                pygame.mixer.music.set_volume(1.0) # Full volume
+                
+                start_time = 0.0
+                if style == "Aura":
+                    # If we sped it up 2x, the 10s mark of the *original* song 
+                    # is now the 5s mark of the *current* song.
+                    # But if the user wants "start from 10s" relative to the new song, we keep 10.0.
+                    # Let's assume they mean 10s of the *resulting* audio.
+                    start_time = 10.0 
+                
+                pygame.mixer.music.play(loops=-1, start=start_time)
+            except Exception as e:
+                print(f"[Audio] Could not play {song_path}: {e}")
 
     def detect_gesture(self, lm_list):
         if self.gesture_cooldown > 0:
@@ -846,27 +961,40 @@ class App(ctk.CTk):
             else:
                 self.gesture_history = [] # Clear history when disabled
             
-            # Use fixed dimensions to maintain UI stability
-            ui_width = 480
+            # Save for physics speed calculation
+            self.prev_lm_list = lm_list
             
-            # ---- Camera Feed Updates ----
+            # Use dynamic dimensions based on window size
+            art_width = self.video_frame.winfo_width()
+            if art_width <= 10:  # Fallback before fully rendered
+                art_width = 800
+                
+            pip_width = 240 # Fixed size for PiP
+            
+            # ---- Camera Feed Updates (PiP) ----
             img_rgb = cv2.cvtColor(img_processed, cv2.COLOR_BGR2RGB)
             pil_img = Image.fromarray(img_rgb)
-            ratio = ui_width / pil_img.width
-            new_size = (int(pil_img.width * ratio), int(pil_img.height * ratio))
+            ratio_pip = pip_width / pil_img.width
+            new_size_pip = (int(pil_img.width * ratio_pip), int(pil_img.height * ratio_pip))
             
-            ctk_img = ctk.CTkImage(light_image=pil_img, size=new_size)
-            self.lbl_video.configure(image=ctk_img)
-            self.lbl_video.image = ctk_img
+            if new_size_pip[0] > 0 and new_size_pip[1] > 0:
+                ctk_img = ctk.CTkImage(light_image=pil_img, size=new_size_pip)
+                self.lbl_video.configure(image=ctk_img)
+                self.lbl_video.image = ctk_img
             
-            # ---- Stickman Art Updates ----
+            # ---- Stickman Art Updates (Full Canvas) ----
             if self.switch_draw_stickman.get() == 1:
                 art_img = self.draw_stickman(img, lm_list)
                 art_img_rgb = cv2.cvtColor(art_img, cv2.COLOR_BGR2RGB)
                 pil_art = Image.fromarray(art_img_rgb)
-                ctk_art = ctk.CTkImage(light_image=pil_art, size=new_size)
-                self.lbl_art.configure(image=ctk_art)
-                self.lbl_art.image = ctk_art
+                
+                ratio_art = art_width / pil_art.width
+                new_size_art = (int(pil_art.width * ratio_art), int(pil_art.height * ratio_art))
+                
+                if new_size_art[0] > 0 and new_size_art[1] > 0:
+                    ctk_art = ctk.CTkImage(light_image=pil_art, size=new_size_art)
+                    self.lbl_art.configure(image=ctk_art)
+                    self.lbl_art.image = ctk_art
             else:
                 self.lbl_art.configure(image=self._blank_img)
 
@@ -881,6 +1009,9 @@ class App(ctk.CTk):
                 self.viven_detector.close()
             if hasattr(self, 'holistic_detector') and self.holistic_detector:
                 self.holistic_detector.close()
+            if _PYGAME_AVAILABLE:
+                pygame.mixer.music.stop()
+                pygame.mixer.quit()
         except:
             pass
         self.destroy()
